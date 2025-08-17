@@ -1,6 +1,6 @@
-docker buildx build \
-  --platform linux/amd64 \
+docker buildx build \                                                                                                                                    main [e00c39ce] modified untracked
+  --platform linux/arm64 \
   -f Dockerfile \
-  -t exegol:full-amd64 \
+  -t exegol:full-3.1.7-arm64 \
   --load \
   .
