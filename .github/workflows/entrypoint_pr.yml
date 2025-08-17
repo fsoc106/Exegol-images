@@ -1,0 +1,171 @@
+name: External PR tests
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - "*.*.*"
+      - "*.*.*b*"
+    paths-ignore: # not always respected. See https://github.com/actions/runner/issues/2324#issuecomment-1703345084
+      - ".github/**"
+      - "**.md"
+
+env:
+  # fake local registry for final images
+  FAKE_LOCAL_REGISTRY: "nwodtuhs/exegol-local"
+
+  # final image parameters
+  IMAGE_TARGET_REGISTRY: "nwodtuhs/exegol-preprod"
+  DOCKERFILE: "./Dockerfile"
+
+# creating a separate concurrency group for each PR
+# so that our "PR checks" are always running for the latest commit in the PR
+# and as PRs are updated we want to make sure "in progress" jobs are killed so we don't waste resources
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  init:
+    name: Initialize
+    runs-on: self-hosted
+    outputs:
+      FAKE_LOCAL_REGISTRY: ${{ steps.varset.outputs.FAKE_LOCAL_REGISTRY }}
+      IMAGE_TAG: ${{ steps.varset.outputs.IMAGE_TAG }}
+      DOCKERFILE: ${{ steps.varset.outputs.DOCKERFILE }}
+    steps:
+      - name: Setting variables
+        id: varset
+        run: |
+          PR_NUMBER=$(echo ${{ github.ref }} | awk 'BEGIN { FS = "/" } ; { print $3 }')
+          echo "FAKE_LOCAL_REGISTRY=${{ env.FAKE_LOCAL_REGISTRY }}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=PR${PR_NUMBER}" >> $GITHUB_OUTPUT
+          echo "DOCKERFILE=${{ env.DOCKERFILE }}" >> $GITHUB_OUTPUT
+          cat $GITHUB_OUTPUT
+
+  code_check:
+    name: Code compliance check
+    needs: init
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@main
+      - name: Check colorecho
+        run: python3 ~/exegol-pipelines-tools/code_compliance_check.py colorecho
+      - name: Check add-aliases
+        run: python3 ~/exegol-pipelines-tools/code_compliance_check.py add-aliases
+      - name: Check add-history
+        run: python3 ~/exegol-pipelines-tools/code_compliance_check.py add-history
+      - name: Check add-test-command
+        run: python3 ~/exegol-pipelines-tools/code_compliance_check.py add-test-command
+      - name: Check add-to-list
+        run: python3 ~/exegol-pipelines-tools/code_compliance_check.py add-to-list
+      - name: Temp-fix check
+        run: python3 ~/exegol-pipelines-tools/code_compliance_check.py temp-fix
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        env:
+          SHELLCHECK_OPTS: -e SC1071 -e SC2148 -e SC1090 -e SC1091 -e SC2317
+        with:
+          ignore_names: >-
+            zshrc
+            bashrc
+
+  build:
+    name: Final image build
+    needs: [ init, code_check ]
+    # only running build if code check was a success
+    if: needs.code_check.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ arm64, amd64 ]
+    runs-on:
+      - self-hosted
+      - builder
+      - ${{ matrix.arch }}
+    timeout-minutes: 360
+    steps:
+      - name: Clean dangling build cache
+        run: docker builder prune --force
+      - name: Clean Exegol dangling images
+        run: docker image prune --force --filter "label=org.exegol.app=Exegol"
+      - name: Clean unused local volumes
+        run: docker volume prune --force
+      - name: Checkout
+        uses: actions/checkout@main
+      - name: Prepare build
+        id: prepare
+        run: echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
+      - name: Build the image
+        if: success()
+        uses: docker/build-push-action@master
+        with:
+          load: true
+          no-cache: true
+          build-args: |
+            TAG=${{ needs.init.outputs.IMAGE_TAG }}
+            VERSION=${{ needs.init.outputs.IMAGE_TAG }}
+            BUILD_DATE=${{ steps.prepare.outputs.BUILD_DATE }}
+          tags: "${{ env.FAKE_LOCAL_REGISTRY }}:${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }}"
+          platforms: linux/${{ matrix.arch }}
+          file: ${{ needs.init.outputs.DOCKERFILE }}
+          context: .
+
+  test:
+    name: Test image
+    needs: [ init, build ]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ arm64, amd64 ]
+    runs-on:
+      - self-hosted
+      - tester
+      - ${{ matrix.arch }}
+    timeout-minutes: 5
+    steps:
+      - name: Inspect the image
+        run: docker inspect ${{ env.FAKE_LOCAL_REGISTRY }}:${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }}
+      - name: Create a container from the built image
+        run: |
+          docker run --name exegol-unit-tests-${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }} --rm -t -d ${{ env.FAKE_LOCAL_REGISTRY }}:${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }} endless
+      - name: Copy the unit tests script
+        run: docker cp ~/exegol-pipelines-tools/run_unit_tests.py exegol-unit-tests-${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }}:/.exegol/
+      - name: Run the tests
+        if: success()
+        run: |
+          docker exec exegol-unit-tests-${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }} python3 /.exegol/run_unit_tests.py
+      - name: Print the failed tests if any
+        if: failure()
+        run: |
+          docker exec exegol-unit-tests-${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }} cat /.exegol/unit_tests_failed_commands.log
+      - name: Print the successful tests
+        if: always()
+        run: |
+          docker exec exegol-unit-tests-${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }} cat /.exegol/unit_tests_success_commands.log
+      - name: Stop the container
+        if: always()
+        run: docker stop exegol-unit-tests-${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }}
+
+  clean_runners:
+    name: Clean runner
+    needs: [ init, test ]
+    if: always()
+    # even if this job fails, it won't affect the success/fail status of the whole workflow
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [ arm64, amd64 ]
+    runs-on:
+      - self-hosted
+      - builder
+      - ${{ matrix.arch }}
+    steps:
+      - name: List docker images
+        run: docker image ls
+      - name: Remove local image
+        # always removing image, no need to keep it on the runner
+        if: always()
+        run: docker rmi ${{ env.FAKE_LOCAL_REGISTRY }}:${{ needs.init.outputs.IMAGE_TAG }}-${{ matrix.arch }}
